@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /tmp)",
+      "Bash(cp \"c:/Users/User/growtomation/getac/GETAC Scripts.docx\" getac.docx)",
+      "Bash(unzip -o -q getac.docx -d getac_docx)",
+      "Read(//tmp/getac_docx/**)",
+      "Bash(sed -e 's/<\\\\/w:p>/\\\\n/g' -e 's/<w:tab\\\\/>/\\\\t/g' -e 's/<w:br\\\\/>/\\\\n/g' document.xml)",
+      "Bash(sed -e 's/<[^>]*>//g')",
+      "Read(//tmp/**)",
+      "Bash(sed 's/&quot;/\"/g; s/&amp;/\\\\&/g; s/&lt;/</g; s/&gt;/>/g; s/&#39;/'\"'\"'/g' /tmp/getac_text.txt > /tmp/getac_clean.txt && sed -n '100,303p' /tmp/getac_clean.txt)",
+      "Bash(cp \"c:/Users/User/growtomation/getac/BD and Reseller list - Germany & France.xlsx\" bd.xlsx)",
+      "Bash(unzip -o -q bd.xlsx -d bd_xlsx)",
+      "Bash(cd /tmp/bd_xlsx/xl && echo \"=== workbook sheets ===\" && sed 's/<[^>]*>/\\\\n/g' workbook.xml | grep -i 'name=' ; echo; echo \"=== sheet count of cells ===\" && grep -o '<c ' worksheets/sheet1.xml | wc -l)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  }
+}
