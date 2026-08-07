@@ -18,12 +18,18 @@
  *                                           + auto-created "Consolidated - <Company>"
  *
  * WHAT IT PRODUCES:
- *   - COUNTRY consolidated `leads_data` = ALL BD + ALL reseller leads in the country.
- *   - COMPANY consolidated `leads_data` = all of one reseller company's employee leads.
+ *   - COUNTRY consolidated `leads_data` = ONLINE leads (from the master reseller
+ *     dashboard, filtered to the country) + ALL BD + ALL reseller OFFLINE leads.
+ *   - COMPANY consolidated `leads_data` = all of one reseller company's employee
+ *     leads (OFFLINE only — online leads have no reseller company).
  *   Both deduped by Record ID (Col A), columns mapped BY HEADER NAME into one
- *   canonical layout (the BD superset) so reseller rows never shift.
+ *   canonical SUPERSET layout (CN_CANONICAL_HEADERS) so a source that lacks a
+ *   column just leaves it blank and nothing ever shifts.
  *
- * OFFLINE LEADS ONLY (per scope). Online leads live in HubSpot, not these sheets.
+ * ONLINE vs OFFLINE is decided by SOURCE, not per row: the master dashboard is
+ * 100% online (→ "Online/Campaigns"); the per-rep folder sheets are offline
+ * (→ "Offline/Events"). Stamped into the "Contact Source" column on write.
+ * On a Record ID collision, ONLINE wins (master aggregated first).
  *
  * The `dashboard` (charts) tab is NOT built here — those are native pivot-charts
  * set up once in the Sheets UI (out of code scope). This engine owns the DATA.
@@ -39,7 +45,7 @@
 
 // ========================= CONFIG =========================
 
-const CN_DRY_RUN = true;   // true = log only, no create/write. Flip to false to act.
+const CN_DRY_RUN = false;   // true = log only, no create/write. Flip to false to act.
 
 // The ONLY hardcoded structure: region roots. Each must contain the Country folders.
 const CN_REGION_ROOTS = {
@@ -51,18 +57,97 @@ const CN_SOURCE_TAB = 'Leads Data';   // tab inside each BD/reseller employee sh
 const CN_DEST_TAB   = 'leads_data';   // tab inside each consolidated sheet
 const CN_ID_COL     = 1;              // Column A = Record ID
 
-// Source header -> canonical (BD) header. Compared lowercased/trimmed.
-const CN_HEADER_ALIASES = { 'name': 'last name', 'comments': 'getac sales comments' };
+// --- ONLINE LEADS SOURCE (master reseller dashboard) ---------------------------
+// The master holds ALL online leads for every country. We read its "Leads Data"
+// tab, filter to the COUNTRY being built (matched on the country folder name, not
+// the region — a region root holds several country folders), map its columns into
+// the canonical layout by header name, and stamp them online.
+const CN_MASTER_ID          = '1TW4Eq0gIXstPHUPfSphhe9gCcWaEAenvhV8BWYfP5iQ';
+const CN_MASTER_TAB         = 'Leads Data';
+const CN_MASTER_COUNTRY_HDR = 'country';        // header (lowercased) that holds the country
+
+// Which countries pull ONLINE leads, and the master Country value(s) that match
+// each (lowercased, full names per the master). Keyed by the COUNTRY FOLDER name
+// (lowercased). SCOPE: only Germany + France are in scope for online leads — any
+// other country folder (Switzerland, Austria, …) pulls NO online rows and stays
+// offline-only. The folder-name key is matched as a case-insensitive substring so
+// "01 - Germany" etc. still resolve.
+const CN_ONLINE_COUNTRY_MATCH = {
+  'germany': ['germany'],
+  'france':  ['france']
+};
+
+// --- CONTACT SOURCE (online/offline label) -------------------------------------
+const CN_CONTACT_SOURCE_HDR = 'contact source';
+const CN_SOURCE_ONLINE      = 'Online/Campaigns';
+const CN_SOURCE_OFFLINE     = 'Offline/Events';
+
+// --- CANONICAL SUPERSET LAYOUT -------------------------------------------------
+// The combined country sheet's columns. This is the UNION of the BD + reseller +
+// online layouts (per the POC's "Final Country Sheet" spec): any source that
+// lacks a column simply leaves it blank, so columns never shift. Everything is
+// matched into this by HEADER NAME (+ CN_HEADER_ALIASES). Change the order/names
+// here and the whole build follows. ("Getac Sales" is intentionally blank for now
+// — no source feeds it yet.)
+const CN_CANONICAL_HEADERS = [
+  'Record ID', 'First Name', 'Last Name', 'Company Name', 'Email', 'Country',
+  'Industry', 'Job Title', 'Job Function', 'Customer Comment', 'Telephone Number',
+  'Postal code', 'Event Name', 'Reseller Name', 'Reseller Email', 'Getac Sales',
+  'Lead Status', '# of units', 'Product Model', 'Getac Sales Comments',
+  'Reseller Comments', '3rd Party Data Consent',
+  // Online (master) fields the POC requested. They exist on the master, so online
+  // rows populate; offline rows leave them blank. "Acknowledgement Date" on the
+  // master is literally "Reseller Acknowledgement Date" (matches by name).
+  // "Create Date" is populated on the master (col W) — HubSpot's record-create
+  // timestamp; formatted as a date via CN_DATE_HEADERS below.
+  'SQL', 'Create Date', 'Lead Assignment Date', 'Reseller Acknowledgement Date',
+  'Contact Source', 'Last Updated'
+];
+
+// Source header -> canonical header. Compared lowercased/trimmed. Includes the
+// master (online) renames confirmed by the POC as the same field as their offline
+// column. 'status (sf)' -> 'lead status' confirmed same field: online leads carry
+// their Salesforce status in Lead Status. SF status VALUES may differ from the
+// Lead Status dropdown list — those cells show a warning corner (allow-invalid),
+// never blocking the build.
+const CN_HEADER_ALIASES = {
+  'name': 'last name',
+  'comments': 'getac sales comments',
+  'phone number': 'telephone number',
+  'reseller email - lead management': 'reseller email',
+  'reseller comment': 'reseller comments',
+  'product/model': 'product model',
+  'status (sf)': 'lead status'
+};
 
 // Columns (canonical header names, lowercased) that are DROPDOWNS in the source
 // sheets. setValues() copies text only, NOT validation rules — so after writing
 // we re-apply each column's real dropdown rule, read from a source sheet.
 // Add more header names here if other columns are dropdowns.
-const CN_DROPDOWN_HEADERS = ['lead status'];
+const CN_DROPDOWN_HEADERS = ['lead status', 'contact source'];
 
 // When a consolidated sheet has few/no rows, still show the dropdown on this many
 // rows so the column reads as a dropdown for future entries.
 const CN_DROPDOWN_MIN_ROWS = 500;
+
+// Columns (canonical header names, lowercased) that hold DATES. HubSpot exports
+// date fields as raw epoch MILLISECONDS, so setValues() stores a big number and
+// the cell shows e.g. 1750982400000 instead of a date. After writing we convert
+// those millis to real Dates and stamp a date number format so the column reads
+// as a date. Add header names here as more date columns appear.
+// (Both British/US spellings of "acknowledgement" included on purpose.)
+const CN_DATE_HEADERS = [
+  'last updated',
+  'timestamp',
+  'reseller acknowledgement date',
+  'reseller acknowledgment date',
+  'lead assignment date',
+  'create date'
+];
+
+// Display format for the date columns above. EU style (day/month/year). Change
+// here if the POC wants a different format, or add time (e.g. 'dd/mm/yyyy hh:mm').
+const CN_DATE_FORMAT = 'dd/mm/yyyy';
 
 // Folder-name matchers (lowercased substring). Convention: "01 - Country" etc.
 const CN_IS_COUNTRY_FOLDER  = function (n) { return n.indexOf('country') !== -1; };
@@ -87,16 +172,16 @@ function buildAllConsolidations() {
     const countries = root.getFolders();
     while (countries.hasNext()) {
       const cf = countries.next();
-      try { buildOneCountry_(cf); }
+      try { buildOneCountry_(cf, region); }
       catch (e) { Logger.log('  ❌ country "' + cf.getName() + '" failed: ' + e); }
     }
   });
   Logger.log('Done.');
 }
 
-function buildOneCountry_(countryFolder) {
+function buildOneCountry_(countryFolder, region) {
   const country = countryFolder.getName();
-  Logger.log('— Country: ' + country + ' —');
+  Logger.log('— Country: ' + country + ' (region ' + region + ') —');
 
   // 1) Find the standard subfolders by name convention.
   const subs = { country: null, bd: null, reseller: null };
@@ -111,15 +196,17 @@ function buildOneCountry_(countryFolder) {
   if (!subs.bd)       Logger.log('  ⚠️ no "BD/Sales" subfolder found.');
   if (!subs.reseller) Logger.log('  ⚠️ no "Reseller" subfolder found.');
 
-  // 2) Find the template source sheet — gives BOTH the canonical (BD superset)
-  //    header AND the formatting/dropdown rules to copy onto consolidated sheets.
-  const template = cnFindTemplateSource_(subs.bd, subs.reseller);
-  if (!template) { Logger.log('  ⚠️ no source has a "Record ID" header — skipping country.'); return; }
-  const canonical = template.header;
+  // 2) The canonical layout is now a HARDCODED SUPERSET (CN_CANONICAL_HEADERS),
+  //    not derived from a source — so online (master) and offline sources map
+  //    into the SAME columns and any missing column is just blank. We still find
+  //    a template source (if any) purely for STYLING (header format + dropdowns).
+  const canonical = CN_CANONICAL_HEADERS.slice();
   const canonNorm = canonical.map(cnNorm_);
-  Logger.log('  canonical header: ' + canonical.length + ' cols (template: ' + template.fileId + ')');
+  const template  = cnFindTemplateSource_(subs.bd, subs.reseller);  // may be null
+  Logger.log('  canonical header: ' + canonical.length + ' cols (superset)' +
+             (template ? ' | styling template: ' + template.fileId : ' | no styling template'));
 
-  // 3) Gather source files: all BD employee sheets + every reseller company's employee sheets.
+  // 3) Gather offline source files: all BD sheets + every reseller company's sheets.
   const bdFiles = subs.bd ? cnListSourceSheets_(subs.bd) : [];
 
   const companyFolders = [];
@@ -128,7 +215,7 @@ function buildOneCountry_(countryFolder) {
     while (rit.hasNext()) companyFolders.push(rit.next());
   }
 
-  // 4) COMPANY-level consolidation (one per reseller company) + collect their sources.
+  // 4) COMPANY-level consolidation (OFFLINE only — online leads have no company).
   const allResellerFiles = [];
   companyFolders.forEach(function (compFolder) {
     const company = compFolder.getName();
@@ -136,15 +223,25 @@ function buildOneCountry_(countryFolder) {
     empFiles.forEach(function (f) { allResellerFiles.push(f); });
 
     const rows = cnAggregate_(empFiles, canonNorm);
+    cnStampContactSource_(rows, canonNorm, CN_SOURCE_OFFLINE);
     Logger.log('  [company] ' + company + ': ' + empFiles.length + ' employee sheet(s) → ' + rows.length + ' unique leads');
     const dest = cnFindOrCreateConsolidated_(compFolder, company);
     cnWrite_(dest, canonical, rows, template);
   });
 
-  // 5) COUNTRY-level consolidation = all BD + all reseller sources combined.
-  const countryRows = cnAggregate_(bdFiles.concat(allResellerFiles), canonNorm);
-  Logger.log('  [country] ' + country + ': ' + bdFiles.length + ' BD + ' + allResellerFiles.length +
-             ' reseller sheet(s) → ' + countryRows.length + ' unique leads');
+  // 5) COUNTRY-level consolidation = ONLINE (master, this country) + OFFLINE (BD +
+  //    reseller). Online rows are aggregated FIRST so that on a Record ID
+  //    collision the ONLINE row wins (cnAggregate_ keeps first-seen).
+  const onlineRows = cnReadMasterOnline_(country, canonNorm);
+  cnStampContactSource_(onlineRows, canonNorm, CN_SOURCE_ONLINE);
+
+  const offlineRows = cnAggregate_(bdFiles.concat(allResellerFiles), canonNorm);
+  cnStampContactSource_(offlineRows, canonNorm, CN_SOURCE_OFFLINE);
+
+  const countryRows = cnMergeById_(onlineRows.concat(offlineRows));
+  Logger.log('  [country] ' + country + ': ' + onlineRows.length + ' online + ' +
+             offlineRows.length + ' offline (' + bdFiles.length + ' BD + ' +
+             allResellerFiles.length + ' reseller sheet(s)) → ' + countryRows.length + ' unique leads');
   if (subs.country) {
     const dest = cnFindOrCreateCountrySheet_(subs.country, country);
     cnWrite_(dest, canonical, countryRows, template);
@@ -177,6 +274,80 @@ function cnAggregate_(files, canonNorm) {
 function cnColumnMap_(srcHeader, canonNorm) {
   const srcNorm = srcHeader.map(function (h) { const n = cnNorm_(h); return CN_HEADER_ALIASES[n] || n; });
   return canonNorm.map(function (cn) { return srcNorm.indexOf(cn); });
+}
+
+// Read ONLINE leads from the master dashboard, filtered to THIS country (by folder
+// name → CN_ONLINE_COUNTRY_MATCH), mapped into the canonical layout by header name.
+// Returns canonical rows (deduped by Record ID, first-seen). Logs any master column
+// that found NO home in the canonical layout, so nothing is silently dropped.
+// Countries not in scope (not Germany/France) pull nothing. Never throws.
+function cnReadMasterOnline_(country, canonNorm) {
+  const key = String(country || '').toLowerCase();
+  let wanted = null;
+  Object.keys(CN_ONLINE_COUNTRY_MATCH).forEach(function (k) {
+    if (!wanted && key.indexOf(k) !== -1) wanted = CN_ONLINE_COUNTRY_MATCH[k];
+  });
+  if (!wanted || !wanted.length) { Logger.log('    [online] "' + country + '" not in online scope — 0 online rows.'); return []; }
+
+  let src;
+  try {
+    const sh = SpreadsheetApp.openById(CN_MASTER_ID).getSheetByName(CN_MASTER_TAB);
+    if (!sh) { Logger.log('    ⚠️ master tab "' + CN_MASTER_TAB + '" not found — no online rows.'); return []; }
+    const vals = sh.getDataRange().getValues();
+    if (vals.length < 2) return [];
+    src = { header: vals[0], data: vals.slice(1) };
+  } catch (e) { Logger.log('    ⚠️ cannot read master online source: ' + e); return []; }
+
+  // Diagnostic: master columns with no canonical home (once, before mapping).
+  const srcNorm = src.header.map(function (h) { const n = cnNorm_(h); return CN_HEADER_ALIASES[n] || n; });
+  const dropped = [];
+  srcNorm.forEach(function (n, i) {
+    if (n && canonNorm.indexOf(n) === -1 && dropped.indexOf(src.header[i]) === -1) dropped.push(src.header[i]);
+  });
+  if (dropped.length) Logger.log('    [online] master columns with NO canonical home (dropped): ' + dropped.join(', '));
+
+  const map        = cnColumnMap_(src.header, canonNorm);
+  const countryIdx = srcNorm.indexOf(CN_MASTER_COUNTRY_HDR);
+  if (countryIdx === -1) Logger.log('    ⚠️ master has no "' + CN_MASTER_COUNTRY_HDR + '" column — cannot filter; taking NO online rows.');
+
+  const byId = {}, order = [];
+  let scanned = 0, matched = 0;
+  src.data.forEach(function (r) {
+    scanned++;
+    if (countryIdx === -1) return;                         // can't filter safely → skip all
+    const cval = cnNorm_(r[countryIdx]);
+    if (wanted.indexOf(cval) === -1) return;               // not this region's country
+    const id = r[CN_ID_COL - 1];
+    if (id === '' || id === null || id === undefined) return;
+    const key = String(id);
+    if (byId[key] !== undefined) return;                   // dedup within master
+    byId[key] = map.map(function (si) { return si === -1 ? '' : (r[si] == null ? '' : r[si]); });
+    order.push(key); matched++;
+  });
+  Logger.log('    [online] master scanned ' + scanned + ' rows, matched ' + wanted.join('/') + ' = ' + matched + '.');
+  return order.map(function (k) { return byId[k]; });
+}
+
+// Stamp the Contact Source column (by canonical header) on every row of an
+// already-mapped canonical row set. No-op if the column isn't in the layout.
+function cnStampContactSource_(rows, canonNorm, label) {
+  const col = canonNorm.indexOf(CN_CONTACT_SOURCE_HDR);
+  if (col === -1) return;
+  rows.forEach(function (row) { row[col] = label; });
+}
+
+// Merge already-canonical rows, deduping by Record ID (Col A), FIRST-seen wins.
+// Online rows are concatenated before offline, so online wins on collision.
+function cnMergeById_(rows) {
+  const seen = {}, out = [];
+  rows.forEach(function (row) {
+    const id = row[CN_ID_COL - 1];
+    if (id === '' || id === null || id === undefined) return;
+    const key = String(id);
+    if (seen[key]) return;
+    seen[key] = true; out.push(row);
+  });
+  return out;
 }
 
 // Template source = first source whose Col-A header is "Record ID" — BD folder
@@ -279,6 +450,11 @@ function cnWrite_(dest, canonical, rows, template) {
   sh.getRange(1, 1, 1, canonical.length).setValues([canonical]);
   if (rows.length) sh.getRange(2, 1, rows.length, canonical.length).setValues(rows);
 
+  // HubSpot ships dates as epoch millis (plain numbers). Convert the configured
+  // date columns to real Dates + stamp a date format so they don't read as
+  // 1750982400000. Safe on a rebuilt rollup — never flows back to sources.
+  if (rows.length) cnFormatDateColumns_(sh, canonical, rows.length);
+
   if (template && template.fileId) cnApplyTemplateStyling_(sh, canonical, rows.length, template.fileId);
   Logger.log('    ✅ wrote ' + rows.length + ' rows to "' + dest.getName() + '"');
 }
@@ -330,6 +506,18 @@ function cnApplyTemplateStyling_(destSheet, canonical, dataRowCount, templateFil
     const tplCol  = tplNorm.indexOf(hName);
     if (destCol === -1 || tplCol === -1) return;          // column not present on one side
 
+    // Contact Source: build the rule directly from the known online/offline
+    // values — the offline template sheets may not carry a validation rule for
+    // it, and we control this list ourselves.
+    if (hName === CN_CONTACT_SOURCE_HDR) {
+      const csRule = SpreadsheetApp.newDataValidation()
+        .requireValueInList([CN_SOURCE_ONLINE, CN_SOURCE_OFFLINE], true)
+        .setAllowInvalid(true).build();
+      try { destSheet.getRange(2, destCol + 1, rowsToCover, 1).setDataValidation(csRule); }
+      catch (e) { Logger.log('    ⚠️ could not apply "contact source" dropdown: ' + e.message); }
+      return;
+    }
+
     // Use the canonical rule for 'lead status'; template rule otherwise.
     const useCanonical = (hName === 'lead status' && canonicalLeadRule);
     let rule = useCanonical ? canonicalLeadRule : null;
@@ -378,6 +566,46 @@ function cnRemapLeadStatusValues_(sheet, col1based, dataRowCount) {
     if (Object.prototype.hasOwnProperty.call(remap, t)) { vals[i][0] = remap[t]; changed++; }
   }
   if (changed > 0) range.setValues(vals);
+}
+
+// Convert the configured date columns from epoch millis (or numeric strings) to
+// real Date objects and apply a date number format, so HubSpot's raw timestamps
+// (e.g. 1750982400000) display as dates. Values already blank/non-numeric are
+// left untouched. Runs per column so a non-date column is never touched.
+function cnFormatDateColumns_(sheet, canonical, dataRowCount) {
+  const canonNorm = canonical.map(cnNorm_);
+  CN_DATE_HEADERS.forEach(function (hName) {
+    const col = canonNorm.indexOf(hName);
+    if (col === -1) return;                              // this date column not present
+
+    const range = sheet.getRange(2, col + 1, dataRowCount, 1);
+    const vals = range.getValues();
+    let changed = false;
+
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i][0];
+      if (v === '' || v === null || v === undefined) continue;   // keep blanks blank
+      if (v instanceof Date) continue;                            // already a date
+
+      // Accept a number, or a string that is purely digits (millis as text).
+      let ms = null;
+      if (typeof v === 'number' && isFinite(v)) {
+        ms = v;
+      } else if (typeof v === 'string' && /^\d{10,}$/.test(v.trim())) {
+        ms = Number(v.trim());
+      }
+      if (ms === null) continue;                          // not an epoch value — leave as-is
+
+      // HubSpot uses milliseconds (13 digits). If a 10-digit seconds value ever
+      // shows up, scale it up so it's not interpreted as 1970.
+      if (ms < 1e12) ms = ms * 1000;
+      vals[i][0] = new Date(ms);
+      changed = true;
+    }
+
+    if (changed) range.setValues(vals);
+    range.setNumberFormat(CN_DATE_FORMAT);               // stamp format regardless
+  });
 }
 
 function cnNorm_(h) { return String(h == null ? '' : h).trim().toLowerCase(); }

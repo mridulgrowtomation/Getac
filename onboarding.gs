@@ -88,6 +88,10 @@ function onboardAll() {
         // correct regardless of what its original had. (Defined in
         // propagate-dropdown.gs — same project. Never throws.)
         pdStampClone_(cloneId);
+        // Normalize any HubSpot epoch-millis date cells (e.g. Reseller
+        // Acknowledgement Date) so the new clone shows real dates, not raw
+        // numbers. (Defined in fix-dates.gs — same project. Never throws.)
+        fdFixDatesForFile_(cloneId);
       }
     }
 
