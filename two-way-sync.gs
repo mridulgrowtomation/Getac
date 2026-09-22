@@ -89,7 +89,12 @@ function syncAllPairs() {
     let writes = 0;
 
     pairs.forEach(function (p) {
-      writes += syncOnePair_(p, snaps, snapUpdates);
+      try {
+        writes += syncOnePair_(p, snaps, snapUpdates);
+      } catch (e) {
+        // Never let one bad pair abort the whole cycle — log it and move on.
+        Logger.log('⚠️ pair "' + p.label + '" (' + p.originalId + ' ↔ ' + p.cloneId + ') failed, skipping: ' + e);
+      }
     });
 
     saveSnapshots_(snapUpdates);
@@ -154,7 +159,9 @@ function syncOnePair_(pair, snaps, snapUpdates) {
 // ========================= ROW / SHEET HELPERS =========================
 
 function openLeads_(fileId) {
-  const ss = SpreadsheetApp.openById(fileId);
+  let ss;
+  try { ss = SpreadsheetApp.openById(fileId); }
+  catch (e) { Logger.log('⚠️ cannot open ' + fileId + ' — skipping pair: ' + e); return null; }
   const sheet = ss.getSheetByName(SYNC_TAB_NAME);
   if (!sheet) { Logger.log('⚠️ No "' + SYNC_TAB_NAME + '" in ' + fileId); return null; }
 
@@ -174,7 +181,17 @@ function writeRow_(sheet, byId, id, rowVals, width) {
   while (padded.length < width) padded.push('');
   const existing = byId[String(id)];
   if (existing) {
-    sheet.getRange(existing.rowNum, 1, 1, width).setValues([padded]);
+    // A reject-invalid data-validation rule (e.g. a Lead Status / Reseller Email
+    // dropdown with allowInvalid=false) makes setValues THROW when the value copied
+    // from the other side isn't in the list — which aborts the whole cycle. So:
+    // stash the rules, clear them, write, then restore. Restoring a rule onto a cell
+    // whose value is out-of-list does NOT throw (it just flags the cell), so the
+    // dropdowns survive and the sync can never be blocked by validation.
+    const range = sheet.getRange(existing.rowNum, 1, 1, width);
+    const rules = range.getDataValidations();
+    range.clearDataValidations();
+    range.setValues([padded]);
+    range.setDataValidations(rules);
   } else {
     sheet.appendRow(padded);
   }

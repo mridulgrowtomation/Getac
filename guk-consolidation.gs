@@ -4,11 +4,16 @@
 
 // ---------- Execution ----------
 
-const GUK_DRY_RUN = false;
+const GUK_DRY_RUN = true;
 
 // ---------- Mapping / Source Configuration ----------
 
-const GUK_MAPPING_SHEET_ID = "1afWzwlqEus7z7DuVxUgJS0EfWW9KlsZU";
+// Single source of truth: the SAME mapping file guk-sync reads (GS_MAPPING_ID).
+// Was "1afWzwlqEus7z7DuVxUgJS0EfWW9KlsZU" — a STALE copy with only 12 rows (9
+// resellers) that never got the new resellers (GTMN, Ingram Micro ×4, Jarltech,
+// Edico), so consolidation silently missed them. Both scripts now read one file
+// so POC onboards a reseller in ONE place and both systems pick it up.
+const GUK_MAPPING_SHEET_ID = "1AXWJRM700muVENMY4eInIuJ0dvDiPEhlGSkbzPjUpVU";
 const GUK_MAPPING_TAB_NAME = "BD and Reseller List";
 
 // Columns in the mapping/configuration sheet
@@ -66,6 +71,13 @@ const GUK_DROPDOWN_MIN_ROWS = 500;
 // ---------- Contact Source / Deduplication ----------
 
 const GUK_RECORD_ID_HEADER = "Record ID";
+
+// Deal ID is the GO-FORWARD dedup/lookup key (phase 2). Record ID is NO LONGER the
+// dedup key: the SAME Record ID can legitimately appear on multiple rows (one contact,
+// several enquiries), each carrying a UNIQUE Deal ID — those must stay as SEPARATE rows.
+// We dedupe on Deal ID instead, and SKIP any row that has no Deal ID (lookup property
+// absent — e.g. the 2 known test offline records).
+const GUK_DEAL_ID_HEADER = "Deal ID";
 
 const GUK_CONTACT_SOURCE_HEADER = "Contact Source";
 
@@ -125,7 +137,7 @@ const GUK_BD_HEADERS = [
   "3rd Party Data Consent",
   "SQL",
   "Contact Source",
-  "Last Updated"
+  "Deal ID"
 ];
 
 const GUK_RESELLER_INDIVIDUAL_HEADERS = [
@@ -153,7 +165,7 @@ const GUK_RESELLER_INDIVIDUAL_HEADERS = [
   "3rd Party Data Consent",
   "SQL",
   "Contact Source",
-  "Last Updated"
+  "Deal ID"
 ];
 
 const GUK_RESELLER_COMPANY_HEADERS = [
@@ -181,7 +193,7 @@ const GUK_RESELLER_COMPANY_HEADERS = [
   "3rd Party Data Consent",
   "SQL",
   "Contact Source",
-  "Last Updated"
+  "Deal ID"
 ];
 
 const GUK_COUNTRY_CONSOLIDATION_HEADERS = [
@@ -211,7 +223,7 @@ const GUK_COUNTRY_CONSOLIDATION_HEADERS = [
   "3rd Party Data Consent",
   "SQL",
   "Contact Source",
-  "Last Updated"
+  "Deal ID"
 ];
 
 const GUK_ALL_HEADERS = [
@@ -229,7 +241,10 @@ const GUK_HEADER_ALIASES = {
   'reseller email - lead management': 'reseller email',
   'reseller comment': 'reseller comments',
   'product/model': 'product model',
-  'status (sf)': 'lead status'
+  'status (sf)': 'lead status',
+  'dealid': 'deal id',
+  'deal id (hubspot)': 'deal id',
+  'hubspot deal id': 'deal id'
 };
 
 // ========================= MAIN =========================
@@ -473,7 +488,9 @@ function getGUKMappingData_() {
           : "",
 
       sheetLink:
-        String(row[sheetLinkCol] || "").trim()
+        String(row[sheetLinkCol] || "").trim(),
+
+      rowNumber: (i + 1)
     };
 
 
@@ -491,6 +508,21 @@ function getGUKMappingData_() {
         "WARNING: Row " +
         (i + 1) +
         " has no Google Sheet Link. Skipping."
+      );
+
+      continue;
+    }
+
+    // A Drive *folder* link is never a readable source (e.g. the "GUK Folder"
+    // row pointing at the output folder). Skip these quietly so they don't
+    // surface as errors.
+    if (/\/folders\//.test(record.sheetLink)) {
+
+      Logger.log(
+        "Skipping row " +
+        (i + 1) +
+        " (" + (record.resellerName || "?") +
+        "): Google Sheet Link is a Drive folder, not a spreadsheet."
       );
 
       continue;
@@ -715,6 +747,14 @@ function collectGUKSourceRows_(mappingData) {
   let totalSourceRows = 0;
   let totalNormalizedRows = 0;
   let sourcesProcessed = 0;
+  let skippedNoDealId = 0;
+
+  // DIAGNOSTIC (dry-run aid): remember which sheet + Record ID each no-Deal-ID skip
+  // came from, so we can confirm the drops are genuine local-ID/offline test records
+  // and not a Deal ID column that failed to map on some sheet.
+  const skippedSamples = [];
+  const recordIdIndex =
+    GUK_ALL_HEADERS.indexOf(GUK_RECORD_ID_HEADER);
 
 
   mappingData.forEach(function (record) {
@@ -724,6 +764,21 @@ function collectGUKSourceRows_(mappingData) {
 
 
     if (!source) {
+      // Name the mapping row whose sheet could not be opened (e.g. a Drive folder
+      // link pasted into "Google Sheet Link") so the POC can fix that exact row.
+      const folderMatch =
+        String(record.sheetLink || "").match(/\/folders\/([a-zA-Z0-9-_]+)/);
+      const folderId = folderMatch ? folderMatch[1] : "";
+      Logger.log(
+        "SOURCE NOT READ: mapping row " +
+        (record.rowNumber || "?") +
+        " | name: " + (record.resellerName || "?") +
+        " / " + (record.email || "?") +
+        (folderId
+          ? " | THIS IS A DRIVE FOLDER, NOT A SHEET — folder ID: " + folderId
+          : "") +
+        " | link: " + record.sheetLink
+      );
       return;
     }
 
@@ -840,30 +895,12 @@ function collectGUKSourceRows_(mappingData) {
       }
 
 
-      // Skip records without Record ID.
-      // NOTE: this intentionally only rejects a BLANK Record ID. A malformed ID
-      // (e.g. the "12/31/1969" epoch artifact on the Pendrake/Ed Knight lead) is
-      // left to flow through UNCHANGED so it stays visible in the consolidation
-      // until the POC confirms the correct source Record ID. Re-tighten to a
-      // numeric-only check once that's resolved.
-      const recordIdIndex =
-        GUK_ALL_HEADERS.indexOf(
-          "Record ID"
-        );
-
-
-      if (
-        recordIdIndex === -1 ||
-        !String(
-          commonRow[recordIdIndex] || ""
-        ).trim()
-      ) {
-
-        return;
-
-      }
-
-
+      // Collect EVERY normalized row here (no skipping yet). The Deal ID skip runs
+      // AFTER the loop, so that reseller rows carrying a HubSpot Record ID but no Deal
+      // ID can first be enriched with the Deal ID from the BD sheets (Angelica / Ellie
+      // / Alexander) — see the enrichment pass below. Only rows that STILL have no Deal
+      // ID after enrichment (genuine local/offline records with no HubSpot identity) are
+      // dropped.
       allRows.push({
 
         data: commonRow,
@@ -896,6 +933,136 @@ function collectGUKSourceRows_(mappingData) {
   });
 
 
+  // ---------- Deal ID enrichment (BD -> reseller) ----------
+  // Deal ID lands on the BD sheets (HubSpot-enriched) and must flow onto each reseller's
+  // rows so the reseller-wise consolidation carries it. We match on RECORD ID (the only
+  // shared key available today). When a Record ID maps to several BD deals (the repeated-
+  // enquiry case), we disambiguate by CREATE DATE; if even the Create Date is identical
+  // across candidates we cannot tell them apart, so we SKIP that row and flag it in the
+  // log. Done here (not just in guk-sync) so the consolidation is self-healing on every
+  // rebuild regardless of whether the upstream reseller sheet was backfilled.
+  const dealIdIndex = GUK_ALL_HEADERS.indexOf(GUK_DEAL_ID_HEADER);
+  const createDateIndex = GUK_ALL_HEADERS.indexOf("Create Date");
+
+  const hasDealId = function (row) {
+    return dealIdIndex !== -1 &&
+      String(row.data[dealIdIndex] || "").trim() !== "";
+  };
+  const getRecordId = function (row) {
+    return recordIdIndex !== -1
+      ? String(row.data[recordIdIndex] || "").trim()
+      : "";
+  };
+  const getCreateKey = function (row) {
+    return createDateIndex !== -1
+      ? gukNormalizeDateKey_(row.data[createDateIndex])
+      : "";
+  };
+
+  // BD index: Record ID -> [ { dealId, createKey } ] for every BD row that carries both a
+  // Record ID and a Deal ID. Reseller rows are never a Deal ID source.
+  const bdByRecordId = {};
+  allRows.forEach(function (row) {
+    if (String(row.role || "").trim().toLowerCase() !== "bd") return;
+    const rid = getRecordId(row);
+    if (!rid || !hasDealId(row)) return;
+    (bdByRecordId[rid] = bdByRecordId[rid] || []).push({
+      dealId: String(row.data[dealIdIndex]).trim(),
+      createKey: getCreateKey(row)
+    });
+  });
+
+  // --- Diagnostics: understand WHY enrichment finds matches or not ---
+  let diagBdWithBoth = 0;   // BD rows carrying both a Record ID and a Deal ID (the index source)
+  let diagResTotal = 0;     // reseller rows seen
+  let diagResHasDealId = 0; // reseller rows already carrying a Deal ID (read directly from source)
+  let diagResNoId = 0;      // reseller rows with a blank Record ID (unmatchable by Record ID)
+  let diagResHasId = 0;     // reseller rows with a Record ID (matchable)
+  allRows.forEach(function (row) {
+    const r = String(row.role || "").trim().toLowerCase();
+    if (r === "bd") {
+      if (getRecordId(row) && hasDealId(row)) diagBdWithBoth++;
+      return;
+    }
+    if (r !== "reseller") return;
+    diagResTotal++;
+    if (hasDealId(row)) diagResHasDealId++;
+    else if (getRecordId(row)) diagResHasId++;
+    else diagResNoId++;
+  });
+  Logger.log(
+    "Enrichment inputs: BD rows with Record ID + Deal ID = " + diagBdWithBoth +
+    " (" + Object.keys(bdByRecordId).length + " distinct Record IDs) | " +
+    "reseller rows = " + diagResTotal +
+    " (already have Deal ID: " + diagResHasDealId +
+    ", have Record ID to match: " + diagResHasId +
+    ", blank Record ID: " + diagResNoId + ")"
+  );
+
+  let enrichedSingle = 0;   // Record ID hit exactly one BD deal
+  let enrichedByDate = 0;   // multiple BD deals, resolved uniquely by Create Date
+  let flaggedAmbiguous = 0; // multiple BD deals, Create Date could not resolve
+  const flaggedSamples = [];
+
+  allRows.forEach(function (row) {
+    if (String(row.role || "").trim().toLowerCase() !== "reseller") return;
+    if (hasDealId(row)) return;                 // already has one — nothing to do
+    const rid = getRecordId(row);
+    if (!rid) return;                           // no key — handled by the skip pass below
+
+    const candidates = bdByRecordId[rid];
+    if (!candidates || !candidates.length) return;   // not in any BD sheet — skip pass handles it
+
+    if (candidates.length === 1) {
+      row.data[dealIdIndex] = candidates[0].dealId;
+      enrichedSingle++;
+      return;
+    }
+
+    // Repeated-enquiry: same Record ID, several BD deals. Disambiguate by Create Date.
+    const rowKey = getCreateKey(row);
+    const dateMatches = rowKey
+      ? candidates.filter(function (c) { return c.createKey && c.createKey === rowKey; })
+      : [];
+
+    if (dateMatches.length === 1) {
+      row.data[dealIdIndex] = dateMatches[0].dealId;
+      enrichedByDate++;
+      return;
+    }
+
+    // 0 matches (Create Date absent/different) or >1 (identical Create Dates) → cannot tell
+    // which deal this row is → skip + flag.
+    flaggedAmbiguous++;
+    row._dealIdFlagged = true;   // so the skip pass below doesn't re-count/re-list it
+    if (flaggedSamples.length < 40) {
+      flaggedSamples.push(
+        (row.sourceFile || "?") +
+        " | Record ID=" + rid +
+        " | " + candidates.length + " BD deals, " +
+        dateMatches.length + " match Create Date '" + rowKey + "'"
+      );
+    }
+  });
+
+
+  // ---------- Skip rows still lacking a Deal ID ----------
+  // After enrichment, anything without a Deal ID has no HubSpot identity we can key on
+  // (blank Record ID, local offline IDs not in BD, or the flagged-ambiguous rows above).
+  const keptRows = allRows.filter(function (row) {
+    if (hasDealId(row)) return true;
+    if (row._dealIdFlagged) return false;   // already counted/listed in the flagged pass
+    skippedNoDealId++;
+    if (skippedSamples.length < 40) {
+      skippedSamples.push(
+        (row.sourceFile || "?") +
+        " | Record ID=" + (getRecordId(row) || "(blank)")
+      );
+    }
+    return false;
+  });
+
+
   Logger.log(
     "Source Collection: " +
     sourcesProcessed +
@@ -903,11 +1070,60 @@ function collectGUKSourceRows_(mappingData) {
     totalSourceRows +
     " rows read | " +
     totalNormalizedRows +
-    " rows normalized"
+    " rows normalized | " +
+    (enrichedSingle + enrichedByDate) +
+    " enriched from BD (" + enrichedSingle + " by Record ID, " +
+    enrichedByDate + " by Create Date tiebreak) | " +
+    flaggedAmbiguous +
+    " flagged (unresolved multi-enquiry) | " +
+    skippedNoDealId +
+    " rows skipped (no Deal ID)"
   );
 
+  if (flaggedSamples.length) {
+    Logger.log(
+      "FLAGGED — same Record ID + same/absent Create Date, cannot assign a Deal ID — up to 40 shown:\n" +
+      flaggedSamples.join("\n")
+    );
+  }
 
-  return allRows;
+  if (skippedSamples.length) {
+    Logger.log(
+      "Skipped (no Deal ID, no BD match) — up to 40 shown:\n" +
+      skippedSamples.join("\n")
+    );
+  }
+
+
+  return keptRows;
+}
+
+// Normalize a Create Date cell to a day-level key for tiebreak comparison. HubSpot ships
+// dates as epoch millis, Google may hand back a Date object, and hand-typed sheets hold
+// strings — reduce all three to "yyyy-mm-dd" so BD and reseller rows compare on the same
+// footing. Unparseable values fall back to their trimmed lowercase string.
+function gukNormalizeDateKey_(value) {
+  if (value === null || value === undefined || value === "") return "";
+
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return isNaN(value.getTime()) ? "" : gukDayKey_(value);
+  }
+
+  if (typeof value === "number") {
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? String(value) : gukDayKey_(d);
+  }
+
+  const str = String(value).trim();
+  if (!str) return "";
+  const parsed = new Date(str);
+  return isNaN(parsed.getTime()) ? str.toLowerCase() : gukDayKey_(parsed);
+}
+
+function gukDayKey_(d) {
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return d.getFullYear() + "-" + m + "-" + day;
 }
 
 // ========================= GROUPING & DEDUPLICATION =========================
@@ -920,6 +1136,12 @@ function groupGUKRows_(allRows) {
     resellers: {}
   };
 
+  // The "Reseller Name" DATA column on BD (Ellie/Angelica) assignment rows names the
+  // reseller each lead is assigned to. Those BD rows carry the Deal ID, so routing them
+  // into the assigned reseller's group is how Deal IDs reach the reseller sheets.
+  const assignColIndex = GUK_ALL_HEADERS.indexOf("Reseller Name");
+  const bdAssignCounts = {};   // assigned reseller name -> # BD rows (diagnostic)
+
   allRows.forEach(function (row) {
 
     const role =
@@ -928,6 +1150,19 @@ function groupGUKRows_(allRows) {
     if (role === "bd") {
 
       groups.bd.push(row);
+
+      // Also place the assignment row in its reseller's Consolidated group.
+      const assigned = assignColIndex !== -1
+        ? String(row.data[assignColIndex] || "").trim()
+        : "";
+
+      if (assigned) {
+        if (!groups.resellers[assigned]) {
+          groups.resellers[assigned] = [];
+        }
+        groups.resellers[assigned].push(row);
+        bdAssignCounts[assigned] = (bdAssignCounts[assigned] || 0) + 1;
+      }
       return;
     }
 
@@ -948,17 +1183,32 @@ function groupGUKRows_(allRows) {
     }
   });
 
+  // Diagnostic: show how BD-assigned leads spread across resellers. If a name here does
+  // NOT match a reseller folder in the mapping, that reseller's leads won't be written —
+  // this log is how we catch a "CI Distribution" vs "CI Distribution (UK)" style mismatch.
+  const assignSummary = Object.keys(bdAssignCounts)
+    .map(function (name) { return name + " (" + bdAssignCounts[name] + ")"; })
+    .join(", ");
+  Logger.log(
+    "BD assignment routing: " +
+    Object.keys(bdAssignCounts).length +
+    " reseller(s) named on BD rows -> " +
+    (assignSummary || "(none)")
+  );
+
   return groups;
 }
 
 
-// Deduplicate rows using Record ID.
-// Online/Campaigns has priority over Offline/Events.
+// Deduplicate rows using DEAL ID (phase 2 — was Record ID).
+// Two rows that share a Record ID but have DIFFERENT Deal IDs are DIFFERENT enquiries
+// and both survive; only rows sharing the SAME Deal ID collapse to one.
+// Online/Campaigns has priority over Offline/Events on a Deal ID collision.
 function deduplicateGUKRows_(rows) {
 
-  const recordIdIndex =
+  const dealIdIndex =
     GUK_ALL_HEADERS.indexOf(
-      GUK_RECORD_ID_HEADER
+      GUK_DEAL_ID_HEADER
     );
 
   const contactSourceIndex =
@@ -967,16 +1217,35 @@ function deduplicateGUKRows_(rows) {
     );
 
   const records = {};
-  const withoutRecordId = [];
 
   let duplicateCount = 0;
   let offlineSkipped = 0;
 
+  // Clone so we never mutate a source object (a BD assignment row is shared between the BD
+  // group and a reseller group). fillBlanks_ copies any value the donor has into a cell the
+  // keeper left blank — so a field that exists ONLY on the losing duplicate (e.g. a Lead
+  // Status set on the BD assignment row but blank on the reseller row) SURVIVES the merge
+  // instead of being discarded with the losing row. Never overwrites a non-blank keeper cell.
+  const cloneRow = function (row) {
+    const copy = {};
+    for (const k in row) { if (Object.prototype.hasOwnProperty.call(row, k)) copy[k] = row[k]; }
+    copy.data = row.data.slice();
+    return copy;
+  };
+  const fillBlanks = function (keeper, donor) {
+    const k = keeper.data, d = donor.data;
+    for (let c = 0; c < k.length; c++) {
+      const blank = (k[c] === '' || k[c] === null || k[c] === undefined);
+      const donorHas = !(d[c] === '' || d[c] === null || d[c] === undefined);
+      if (blank && donorHas) k[c] = d[c];
+    }
+  };
+
   rows.forEach(function (row) {
 
-    const recordId =
+    const dealId =
       String(
-        row.data[recordIdIndex] || ""
+        row.data[dealIdIndex] || ""
       ).trim();
 
     const contactSource =
@@ -985,24 +1254,23 @@ function deduplicateGUKRows_(rows) {
       ).trim().toLowerCase();
 
 
-    // Keep rows without Record ID.
-    if (!recordId) {
-
-      withoutRecordId.push(row);
+    // No Deal ID → not keyable → skip (should not occur; collection already filters
+    // these out, this is a defensive guard).
+    if (!dealId) {
       return;
     }
 
 
-    // First occurrence of the Record ID.
-    if (!records[recordId]) {
+    // First occurrence of the Deal ID.
+    if (!records[dealId]) {
 
-      records[recordId] = row;
+      records[dealId] = cloneRow(row);
       return;
     }
 
 
     const existingRow =
-      records[recordId];
+      records[dealId];
 
     const existingSource =
       String(existingRow.data[contactSourceIndex] || "" ).trim().toLowerCase();
@@ -1015,11 +1283,15 @@ function deduplicateGUKRows_(rows) {
       contactSource === GUK_ONLINE_SOURCE.toLowerCase();
 
 
-    // Online always wins over Offline.
+    // Online always wins over Offline — the online row becomes the base, but we still fill
+    // its blanks from the offline row so no field is lost.
     if (
       currentIsOnline &&
       !existingIsOnline
-    ) { records[recordId] = row;
+    ) {
+      const winner = cloneRow(row);
+      fillBlanks(winner, existingRow);
+      records[dealId] = winner;
 
       duplicateCount++;
 
@@ -1029,18 +1301,22 @@ function deduplicateGUKRows_(rows) {
     }
 
 
-    // Existing Online record stays.
+    // Existing Online record stays — fill its blanks from the current (offline) row.
     if (
       existingIsOnline &&
       !currentIsOnline
-    ) {duplicateCount++;
+    ) {
+      fillBlanks(existingRow, row);
+
+      duplicateCount++;
 
       offlineSkipped++;
 
       return;
     }
-    // If both are Online or both are Offline,
-    // keep the first occurrence.
+    // Both Online or both Offline → keep the first occurrence, but still fill its blanks
+    // from this duplicate so a value present only here survives.
+    fillBlanks(existingRow, row);
     duplicateCount++;
 
   });
@@ -1049,10 +1325,9 @@ function deduplicateGUKRows_(rows) {
   return {
     rows:
       Object.keys(records)
-        .map(function (recordId) {
-          return records[recordId];
-        })
-        .concat(withoutRecordId),
+        .map(function (dealId) {
+          return records[dealId];
+        }),
 
     duplicates:
       duplicateCount,
@@ -1062,54 +1337,54 @@ function deduplicateGUKRows_(rows) {
   };
 }
 
-// Merge rows that share a Record ID into ONE complete row.
+// Merge rows that share a DEAL ID into ONE complete row (phase 2 — was Record ID).
 // Unlike deduplicateGUKRows_ (which picks a single winning row), this fills
 // each column from the FIRST non-blank value seen across all rows with that
-// Record ID — so a lead that appears on both a BD sheet and a reseller sheet
-// becomes one row that keeps BOTH the BD-side fields (Getac Sales, etc.) and
-// the reseller-side fields (Reseller Comments). First occurrence wins on any
+// Deal ID — so a lead that appears on both a BD sheet and a reseller sheet (SAME
+// Deal ID) becomes one row that keeps BOTH the BD-side fields (Getac Sales, etc.)
+// and the reseller-side fields (Reseller Comments). First occurrence wins on any
 // genuinely conflicting shared cell; blanks are filled from later occurrences.
-// Rows without a Record ID cannot be keyed, so they are kept as-is.
+// Two rows with the same Record ID but DIFFERENT Deal IDs are separate enquiries and
+// are NOT merged (they get distinct keys). Rows without a Deal ID cannot be keyed and
+// are dropped (should not occur — collection already filters them out).
 function mergeGUKRowsById_(rows) {
 
-  const recordIdIndex =
+  const dealIdIndex =
     GUK_ALL_HEADERS.indexOf(
-      GUK_RECORD_ID_HEADER
+      GUK_DEAL_ID_HEADER
     );
 
-  const order = [];      // preserve first-seen order of Record IDs
-  const byId = {};       // recordId -> merged row object (cloned)
-  const withoutRecordId = [];
+  const order = [];      // preserve first-seen order of Deal IDs
+  const byId = {};       // dealId -> merged row object (cloned)
   let mergedCount = 0;
 
   rows.forEach(function (row) {
 
-    const recordId =
+    const dealId =
       String(
-        row.data[recordIdIndex] || ""
+        row.data[dealIdIndex] || ""
       ).trim();
 
-    if (!recordId) {
-      withoutRecordId.push(row);
+    if (!dealId) {
       return;
     }
 
-    if (!byId[recordId]) {
+    if (!byId[dealId]) {
 
       // Clone so we never mutate the caller's row object.
-      byId[recordId] = {
+      byId[dealId] = {
         data: row.data.slice(),
         role: row.role,
         country: row.country,
         resellerName: row.resellerName
       };
 
-      order.push(recordId);
+      order.push(dealId);
       return;
     }
 
-    // Same Record ID again → fill only the cells still blank in the kept row.
-    const kept = byId[recordId].data;
+    // Same Deal ID again → fill only the cells still blank in the kept row.
+    const kept = byId[dealId].data;
 
     for (let c = 0; c < kept.length; c++) {
 
@@ -1133,8 +1408,7 @@ function mergeGUKRowsById_(rows) {
   return {
     rows:
       order
-        .map(function (id) { return byId[id]; })
-        .concat(withoutRecordId),
+        .map(function (id) { return byId[id]; }),
     merged: mergedCount
   };
 }
@@ -2304,9 +2578,19 @@ function writeAllGUKOutputs_(
       resellerFolders.next();
 
 
+    // Only genuine reseller rows get an individual folder + Consolidated sheet.
+    // BD rows are excluded so auto-provisioning never creates a folder for a BD
+    // entity (or any non-reseller row) that happens to carry a name.
     const resellerNames = [
       ...new Set(
         mappingData
+          .filter(function (record) {
+
+            return String(record.role || '')
+              .trim()
+              .toLowerCase() === 'reseller';
+
+          })
           .map(function (record) {
 
             return String(
@@ -2332,19 +2616,44 @@ function writeAllGUKOutputs_(
           );
 
 
-        if (!folders.hasNext()) {
+        let companyFolder;
 
+        if (folders.hasNext()) {
+
+          companyFolder =
+            folders.next();
+
+        } else if (GUK_DRY_RUN) {
+
+          // New reseller from the mapping with no folder yet.
+          // Don't create anything in a dry run — just report it,
+          // then skip (nothing to write into).
           Logger.log(
-            'ERROR: Reseller folder not found: ' +
+            'WOULD CREATE reseller folder + "' +
+            GUK_CONSOLIDATED_PREFIX +
+            resellerName +
+            '": ' +
             resellerName
           );
 
           return;
+
+        } else {
+
+          // Auto-provision the folder so a brand-new reseller row in
+          // the GUK mapping gets its own folder + Consolidated sheet
+          // on the next run — no manual folder creation needed.
+          companyFolder =
+            resellersFolder.createFolder(
+              resellerName
+            );
+
+          Logger.log(
+            'Created reseller folder: ' +
+            resellerName
+          );
+
         }
-
-
-        const companyFolder =
-          folders.next();
 
 
         Logger.log(
